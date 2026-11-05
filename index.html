@@ -196,7 +196,7 @@ details ul{margin:6px 0 0;padding-left:1.2em;line-height:1.6}
       <li>「下をのぞく」で、重なった駒の中身が透けて見える（自分の画面だけ）。</li>
     </ul>
     <ul>
-      <li>オンライン：同じ「あいことば」を入れた2人が同じ部屋に入る。青（先手）と赤は、入室のたびに自動で決まり、「もう一度」で先手が入れ替わる。</li>
+      <li>オンライン：同じ「あいことば」を入れた2人が同じ部屋に入る。青（先手）と赤は、入室のたびに自動で決まり、「もう一度」で先手が入れ替わる。アプリを離れても、相手が戻るのを最大3分は待つ（離れている間、制限時間は止まる）。</li>
     </ul>
   </details>
   </div>
@@ -322,7 +322,10 @@ function cpuChoose(){
 /* 2人のスマホが直接つながる方式(P2P)は、モバイル回線同士だとつながらないことがあるため、公開の中継サーバー(MQTT)を経由する。
    同じ部屋名(あいことばから作る)に書き込んだ内容を、相手が読む。複数のサーバーに同時に送り、1つでも届けばよい。 */
 const BROKERS=['wss://broker.hivemq.com:8884/mqtt','wss://broker.emqx.io:8084/mqtt','wss://test.mosquitto.org:8081'];
-let moves=[],helloId=0,helloTimer=null,lastHello=0;
+/* 相手がアプリを離れても、この時間までは待つ(ミリ秒)。10秒たつと「離れているようです」と表示 */
+const GRACE=180000,STALE_AFTER=10000;
+const STALE_MSG='相手が離れているようです。最大3分は待ちます…';
+let moves=[],helloId=0,helloTimer=null,lastHello=0,lastTickAt=0;
 const CR=(typeof crypto!=='undefined')?crypto:null;
 function hash(s){ // cyrb128：端末が違っても同じ合言葉から同じ値になる
   let h1=1779033703,h2=3144134277,h3=1013904242,h4=2773480762;
@@ -397,10 +400,20 @@ function startRoom(norm,key){
   const myId=rid();
   const clients=[],seenSet={},seen=[],invited={};
   let seq=0,dead=false,partner=null,conn=null,confirmed=false,lastSeen=0,stale=false,everConnected=false,hb=null;
-  const startTs=Date.now();
+  let startTs=Date.now(),lastTick=0;
+  function onVis(){
+    if(dead)return;
+    if(typeof document!=='undefined'&&document.visibilityState==='hidden')return;
+    lastSeen=Date.now();lastTick=Date.now();   // 戻ってきたら、待ち時間を数え直す
+    presence();
+  }
+  if(typeof document!=='undefined'&&document.addEventListener)document.addEventListener('visibilitychange',onVis);
+  if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('pageshow',onVis);
   const room={destroy:function(){
     if(dead)return;
     dead=true;clearInterval(hb);
+    try{if(typeof document!=='undefined'&&document.removeEventListener)document.removeEventListener('visibilitychange',onVis);}catch(e){}
+    try{if(typeof window!=='undefined'&&window.removeEventListener)window.removeEventListener('pageshow',onVis);}catch(e){}
     setTimeout(function(){clients.forEach(function(cl){try{cl.end(true);}catch(e){}});},600);
   }};
 
@@ -439,8 +452,8 @@ function startRoom(norm,key){
     room.destroy();
   }
   function staleHint(on){
-    if(on&&!stale&&net.conn){stale=true;net.msg='相手の応答を待っています…';render();}
-    else if(!on&&stale){stale=false;if(net.msg==='相手の応答を待っています…'){net.msg='';render();}}
+    if(on&&!stale&&net.conn){stale=true;net.msg=STALE_MSG;render();}
+    else if(!on&&stale){stale=false;if(net.msg===STALE_MSG){net.msg='';render();}}
   }
   function presence(){pub({t:'p',st:partner?'g':'w',n:moves.length,g:gameNo});}
 
@@ -503,7 +516,7 @@ function startRoom(norm,key){
 
   BROKERS.forEach(function(url){
     let cl;
-    try{cl=mqtt.connect(url,{clean:true,reconnectPeriod:3000,connectTimeout:8000,keepalive:30});}catch(e){return;}
+    try{cl=mqtt.connect(url,{clean:true,reconnectPeriod:1500,connectTimeout:8000,keepalive:30});}catch(e){return;}
     clients.push(cl);
     cl.on('connect',function(){
       if(dead)return;
@@ -519,12 +532,16 @@ function startRoom(norm,key){
   });
   hb=setInterval(function(){
     if(dead)return;
-    if(!everConnected&&Date.now()-startTs>12000){room.destroy();fail('サーバーに接続できませんでした。ネット接続を確認して、もう一度「入室する」を押してください');return;}
+    const now=Date.now();
+    const frozen=lastTick&&now-lastTick>6000;      // 画面を離れていて、タイマーが止まっていた
+    lastTick=now;
+    if(frozen){lastSeen=now;if(!everConnected)startTs=now;}
+    if(!everConnected&&now-startTs>12000){room.destroy();fail('サーバーに接続できませんでした。ネット接続を確認して、もう一度「入室する」を押してください');return;}
     presence();
     if(conn&&conn.open){
-      const idle=Date.now()-lastSeen;
-      if(idle>60000)closeConn();
-      else if(idle>10000)staleHint(true);
+      const idle=now-lastSeen;
+      if(idle>GRACE)closeConn();
+      else if(idle>STALE_AFTER)staleHint(true);
     }
   },2000);
   return room;
@@ -683,7 +700,7 @@ function maybeCPU(){
 }
 
 /* ---------- 制限時間 ---------- */
-function stopTimer(){if(tId){clearInterval(tId);tId=null;}deadline=0;}
+function stopTimer(){if(tId){clearInterval(tId);tId=null;}deadline=0;lastTickAt=0;}
 function startTimer(){
   stopTimer();
   if(over||!cfg.time)return;
@@ -700,6 +717,9 @@ function tmUI(){
   if(txt)txt.textContent='残り'+Math.ceil(left/1000)+'秒';
 }
 function tick(){
+  const nowT=Date.now();
+  if(lastTickAt&&nowT-lastTickAt>2500)deadline+=nowT-lastTickAt-200;   // 画面を離れていた間は、時間を止める
+  lastTickAt=nowT;
   if(deadline-Date.now()<=0){
     const loser=S.turn;
     if(cfg.mode==='online'&&loser!==me){tmUI();return;} // 相手の時間切れは相手からの通知を待つ
